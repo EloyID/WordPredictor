@@ -1,0 +1,766 @@
+---
+title: "Word Prediction"
+output: html_document
+date: "2023-04-17"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_chunk$set(warning = FALSE)
+knitr::opts_chunk$set(message = FALSE)
+```
+
+```{r libraries}
+set.seed(1234)
+library(tm)
+library(tokenizers)
+library(ggplot2)
+library(dplyr)
+library(cld2)
+library(qdap)
+library(wordcloud)
+library(parallel)
+library(tidyr)
+
+```
+
+
+# Synopsis
+
+The objective of this project is creating a Language Model to predict the next word taking as input the last words written by an user. The model is trained using data coming from Twitter, blogs and news, to have a various type of options. The data is preprocessed to delete foreign words, delete punctuation and curse words, among others. The exploratory analysis showed that the corpus is composed by mainly a small set of words, while existing a great amount of low-frequency words.
+
+The created model makes an interpolation of trigrams, bigrams and unigrams probabilities. Nevertheless, testing the parameters needed for better complexity showed that the best was giving all the weight to the trigrams, ignoring unigrams and bigrams. Not all the data has been used for the training and testing, since the machine used is old and has not much capacity. Some optimization has been applied, like clustering and vectorial filtering.
+
+- [Shiny app](https://eloyinsunza.shinyapps.io/WordPredictor/) 
+- [Slides presentation](https://rpubs.com/EloyID/1037248)
+
+# Preprocessing
+
+The data sources are Twitter, blogs and news and the raw data can be found in this [link](https://d396qusza40orc.cloudfront.net/dsscapstone/dataset/Coursera-SwiftKey.zip). 
+
+```{r read_raw_data}
+con <-
+  file("Coursera-SwiftKey/final/en_US/en_US.twitter.txt", open = "r")
+twitter_raw_data <- readLines(con, encoding = "UTF-8")
+close(con)
+con <-
+  file("Coursera-SwiftKey/final/en_US/en_US.blogs.txt", open = "r")
+blogs_raw_data <- readLines(con, encoding = "UTF-8")
+close(con)
+con <-
+  file("Coursera-SwiftKey/final/en_US/en_US.news.txt", open = "r")
+news_raw_data <- readLines(con, encoding = "UTF-8")
+close(con)
+```
+
+The data is split in three groups, training, validation and testing with proportions 60-20-20. The following output shows an extract of the training data set.
+
+``` {r data_split}
+
+# join all the data
+raw_data = c(twitter_raw_data, blogs_raw_data, news_raw_data)
+
+# useful if you want a smaller data set and work quicker
+sample_proportion = 0.001 # use if you don't want all the data to be read
+
+if (is.numeric(sample_proportion)) {
+  raw_data <- sample(raw_data,
+                     size = sample_proportion * length(raw_data),
+                     replace = FALSE)
+}
+
+# filter foreign sentences
+# if the function is not sure about the language (NA), it is included
+english_raw_data = raw_data[detect_language(raw_data) %in% c("en", NA)]
+
+# training-validation-testing proportions
+training_proportion = 0.6
+validation_proportion = 0.2
+testing_proportion = 1 - training_proportion - validation_proportion
+
+# splitting the data
+testing_split = testing_proportion
+rows_in_testing_set <-
+  as.logical(rbinom(NROW(english_raw_data), 1, testing_split))
+testing_raw_data <- english_raw_data[rows_in_testing_set]
+no_testing_raw_data <- english_raw_data[-rows_in_testing_set]
+
+validation_split = validation_proportion /
+  (validation_proportion + training_proportion)
+rows_in_validation_set <-
+  as.logical(rbinom(NROW(no_testing_raw_data), 1, validation_split))
+validation_raw_data <- no_testing_raw_data[rows_in_validation_set]
+training_raw_data <- no_testing_raw_data[-rows_in_validation_set]
+
+# use if you want smaller sets for the testing and validation
+sample_testing_validation_proportion = 0.05
+if (is.numeric(sample_testing_validation_proportion)) {
+  validation_raw_data <- sample(
+    validation_raw_data,
+    size = sample_testing_validation_proportion * length(validation_raw_data),
+    replace = FALSE
+  )
+  testing_raw_data <- sample(testing_raw_data,
+                             size = sample_testing_validation_proportion * length(testing_raw_data),
+                             replace = FALSE)
+}
+
+# create the corpus
+raw_testing_corpus <- SimpleCorpus(VectorSource(testing_raw_data))
+raw_validation_corpus <-
+  SimpleCorpus(VectorSource(validation_raw_data))
+raw_training_corpus <- SimpleCorpus(VectorSource(training_raw_data))
+
+inspect(raw_training_corpus[1:3])
+```
+
+The preprocessing includes the following steps:
+- Skip the lines in foreign languages, the model predicts English words.
+- Filter profanity words using the list provided by google and imported from this [url]("https://raw.githubusercontent.com/coffee-and-fun/google-profanity-words/main/data/list.txt")
+- Remove numbers and punctuation.
+- Replace contractions like ‘ve, ‘d, ‘s because the predictor will not propose this contractions.
+- Lowercase
+- Remove any element not being a character and stripping whitespaces not being single spaces.
+Nevertheless, common practices like stemming or deleting stop words will not be applied. The model needs to correctly predict stop words (like “to” after “I want”) and full words, not just the stem. 
+
+After preprocessing, the extract looks as follows:
+
+```{r preprocessing}
+
+
+# profanity words pre-work
+profanityWordsFile = "bad-words.txt"
+profanityWordsUrl = "https://raw.githubusercontent.com/coffee-and-fun/google-profanity-words/main/data/list.txt"
+if (!file.exists(profanityWordsFile)) {
+  download.file(profanityWordsUrl, destfile = profanityWordsFile)
+}
+profanityTokens = tokenize_lines(readLines(profanityWordsFile))
+
+
+# Takes a rawCropus as SimpleCorpus object as input and applies the following preprocessing steps :
+# 1. Remove profanity words
+# 2. Remove numbers
+# 3. Replace word contractions
+# 4. Remove punctuation
+# 5. To lowercase
+# 6. Remove not character elements
+# 7. Remove not standard whitespaces
+
+# raw_corpus: SimpleCorpus object to preprocess
+# returns the SimpleCorpus object after having followed the indicated steps
+preprocess_raw_corpus = function(raw_corpus) {
+  tranformed_raw_corpus <- raw_corpus
+  tranformed_raw_corpus <-
+    tm_map(tranformed_raw_corpus,
+           removeWords,
+           unlist(profanityTokens))
+  tranformed_raw_corpus <-
+    tm_map(tranformed_raw_corpus, removeNumbers)
+  tranformed_raw_corpus <-
+    tm_map(tranformed_raw_corpus,
+           content_transformer(replace_contraction))
+  tranformed_raw_corpus <-
+    tm_map(tranformed_raw_corpus, removePunctuation)
+  tranformed_raw_corpus <-
+    tm_map(tranformed_raw_corpus, content_transformer(tolower))
+  
+  symbolsToSpace <-
+    content_transformer(function(x, pattern)
+      gsub(pattern, " ", x))
+  tranformed_raw_corpus <-
+    tm_map(tranformed_raw_corpus, symbolsToSpace, "[^a-zA-Z]")
+  tranformed_raw_corpus <-
+    tm_map(tranformed_raw_corpus, stripWhitespace)
+  tranformed_raw_corpus
+}
+
+preprocessed_testing_corpus = preprocess_raw_corpus(raw_testing_corpus)
+preprocessed_validation_corpus = preprocess_raw_corpus(raw_validation_corpus)
+preprocessed_training_corpus = preprocess_raw_corpus(raw_training_corpus)
+
+inspect(preprocessed_training_corpus[1:3])
+```
+
+# Exploratory data analysis
+
+
+## Unigrams, bigrams and trigrams distribution
+```{r n_grams_creation}
+
+# list of all words
+unigrams = tokenize_words(paste(preprocessed_training_corpus$content, collapse = " "))
+# data frame with
+# Freq: freq of each word
+# unigrams: word
+unigrams_freq = as.data.frame(table(unigrams))
+unigrams_freq = arrange(unigrams_freq, desc(Freq))
+# data frame with the Freq of word frequencies
+# Freq: freq of word frequency
+# Var1: word frequency
+# Example: if there are 60 different words appearing 78 times each,
+# Var1: 78, Freq: 60
+unigrams_freq_freq = as.data.frame(table(table(unigrams)))
+unigrams_freq_freq$density = unigrams_freq_freq$Freq /
+  sum(unigrams_freq_freq$Freq)
+
+# list of all bigrams
+bigrams = unlist(tokenize_ngrams(preprocessed_training_corpus$content, n = 2))
+# data frame with
+# Freq: freq of each bigram
+# bigrams: bigram
+bigrams_freq = as.data.frame(table(bigrams))
+bigrams_freq = arrange(bigrams_freq, desc(Freq))
+bigrams_freq$bigrams = factor(bigrams_freq$bigrams, levels = bigrams_freq$bigrams)
+bigrams_freq <- separate(
+  bigrams_freq,
+  bigrams,
+  c("last_word_1", "last_word"),
+  sep = " ",
+  remove = FALSE
+)
+# data frame with the Freq of bigram frequencies
+# Freq: freq of bigram frequency
+# Var1: bigram frequency
+# Example: if there are 60 different bigrams appearing 78 times each,
+# Var1: 78, Freq: 60
+bigrams_freq_freq = as.data.frame(table(table(bigrams)))
+bigrams_freq_freq$density = bigrams_freq_freq$Freq / sum(bigrams_freq_freq$Freq)
+
+# list of all trigrams
+trigrams = unlist(tokenize_ngrams(preprocessed_training_corpus$content, n = 3))
+# data frame with
+# Freq: freq of each trigram
+# trigrams: trigram
+trigrams_freq = as.data.frame(table(trigrams))
+trigrams_freq = arrange(trigrams_freq, desc(Freq))
+trigrams_freq$trigrams = factor(trigrams_freq$trigrams, levels = trigrams_freq$trigrams)
+trigrams_freq <-
+  separate(
+    trigrams_freq,
+    trigrams,
+    c("last_word_2", "last_word_1", "last_word"),
+    sep = " ",
+    remove = FALSE
+  )
+# data frame with the Freq of trigram frequencies
+# Freq: freq of trigram frequency
+# Var1: trigram frequency
+# Example: if there are 60 different trigrams appearing 78 times each,
+# Var1: 78, Freq: 60
+trigrams_freq_freq = as.data.frame(table(table(trigrams)))
+trigrams_freq_freq$density = trigrams_freq_freq$Freq / sum(trigrams_freq_freq$Freq)
+```
+
+The following word cloud shows the most used words in the training data set. As expected, among them stop words and common verbs. The following plot shows that most of the words appear only once.  
+
+```{r unigrams_plotting}
+layout(matrix(c(1, 2), nrow = 1))
+
+wordcloud(
+  unigrams_freq$unigrams,
+  unigrams_freq$Freq,
+  scale = c(7, 1),
+  max.words = 50,
+  random.order = FALSE
+)
+
+plot(
+  unigrams_freq_freq$density,
+  main = "Unigrams frequency density",
+  xlab = "Number of times in the data",
+  ylab = "Density"
+)
+```
+
+The following word cloud shows the most used bigrams in the training data set. As expected, among them a combination of stop words and common verbs. The density plot is similar to the precedent one, but even more gathered to the initial values. This is logical, every unique word will create unique bigrams.  
+
+```{r bigrams_plotting}
+layout(matrix(c(1, 2), nrow = 1))
+
+wordcloud(
+  bigrams_freq$bigrams,
+  bigrams_freq$Freq,
+  scale = c(7, 1),
+  max.words = 50,
+  random.order = FALSE
+)
+
+plot(
+  bigrams_freq_freq$density,
+  main = "Bigrams frequency density",
+  xlab = "Number of times in the data",
+  ylab = "Density"
+)
+```
+
+The next plots shows that the trend seen in the bigrams continues for the trigrams. 
+
+```{r trigrams_plotting}
+layout(matrix(c(1, 2), nrow = 1))
+
+wordcloud(
+  trigrams_freq$trigrams,
+  trigrams_freq$Freq,
+  scale = c(7, 1),
+  max.words = 50,
+  random.order = FALSE
+)
+
+plot(
+  trigrams_freq_freq$density,
+  main = "Trigrams frequency density",
+  xlab = "Number of times in the data",
+  ylab = "Density"
+)
+```
+
+## Vocabulary coverage
+
+```{r vocabulary_coverage}
+
+# total of different words
+vocabulary_size = sum(unigrams_freq_freq$Freq)
+# total words
+words_instances = sum(unigrams_freq_freq$Freq * as.numeric(unigrams_freq_freq$Var1))
+
+# calculate number of different words to cover word_coverage proportion of total
+# words
+# word_coverage: proportion of total words to be covered between 0 and 1
+# returns number of words needed
+calculate_dico_size_for_word_coverage = function(word_coverage) {
+  unigrams_freq_freq_desc = arrange(unigrams_freq_freq, desc(Var1))
+  unigrams_freq_freq_desc$Var1 = as.numeric(unigrams_freq_freq_desc$Var1)
+  word_instances_covered = word_coverage * words_instances
+  index = which(
+    cumsum(
+      unigrams_freq_freq_desc$Var1 * unigrams_freq_freq_desc$Freq
+    ) > word_instances_covered
+  )[[1]]
+  index_1 = index - 1
+  needed_words_count = sum(unigrams_freq_freq_desc[1:(index_1), ]$Freq) +
+    (
+      word_instances_covered -
+        sum(
+          unigrams_freq_freq_desc[1:(index_1), ]$Var1 *
+            unigrams_freq_freq_desc[1:(index_1), ]$Freq
+        )
+    ) /
+    unigrams_freq_freq_desc[index_1, ]$Freq
+  
+  ceiling(needed_words_count)
+}
+
+words_50_coverage = calculate_dico_size_for_word_coverage(word_coverage = 0.5)
+words_75_coverage = calculate_dico_size_for_word_coverage(word_coverage = 0.75)
+words_90_coverage = calculate_dico_size_for_word_coverage(word_coverage = 0.9)
+words_95_coverage = calculate_dico_size_for_word_coverage(word_coverage = 0.95)
+
+word_coverage_data_frame = data.frame(
+  `Words coverage %` = c(0.5, 0.75, 0.9, 0.95, 1),
+  `Words coverage` = floor(words_instances * c(0.5, 0.75, 0.9, 0.95, 1)),
+  `Vocabulary needed` = c(
+    words_50_coverage,
+    words_75_coverage,
+    words_90_coverage,
+    words_95_coverage,
+    vocabulary_size
+  ),
+  `Vocabulary needed %` = round(
+    c(
+      words_50_coverage,
+      words_75_coverage,
+      words_90_coverage,
+      words_95_coverage,
+      vocabulary_size
+    ) / vocabulary_size,
+    3
+  )
+)
+```
+
+Since most of the words appear only once, how extensive does the dictionary need to be to cover 50, 75, 90 and 95% of the word instances? The following table shows that only 2% of the vocabulary accounts for 50% of word instances, which is logical with the plots shown in the point before. This correspond to mostly stop words and common verbs. As we need more words instances coverage, the proportion of vocabulary grows quicker, because the words become less and less frequent. Nevertheless, to account for 95% of the word instances we need less than 50% of the vocabulary.
+
+```{r}
+word_coverage_data_frame
+```
+
+# Model
+
+```{r modeling_preprocess}
+
+
+word_threshold = 5
+# two data frames with the unigrams separated by the threshold
+unigrams_high_freq = filter(unigrams_freq, Freq > word_threshold)
+unigrams_low_freq = filter(unigrams_freq, Freq <= word_threshold)
+
+unknown_word_token = "__UNK__"
+
+unigrams_high_freq = unigrams_high_freq %>%
+  mutate(logprobability = log(Freq / sum(Freq)))
+
+# subsitute in new data frames the uncommon words by unknown
+bigrams_freq_with_unk = data.frame(bigrams_freq)
+trigrams_freq_with_unk = data.frame(trigrams_freq)
+
+# change in an array of word the low frequency words into unknown token
+# words_array: the array of words
+# returns an array of words modified
+substitute_low_freq_words = function(words_array) {
+  words_array[!words_array %in% unigrams_high_freq$unigrams] =
+    unknown_word_token
+  words_array
+}
+
+bigrams_freq_with_unk$last_word_1 =
+  substitute_low_freq_words(bigrams_freq_with_unk$last_word_1)
+bigrams_freq_with_unk$last_word =
+  substitute_low_freq_words(bigrams_freq_with_unk$last_word)
+bigrams_freq_with_unk = subset(bigrams_freq_with_unk, select = -bigrams)
+bigrams_freq_with_unk = bigrams_freq_with_unk %>%
+  group_by(last_word, last_word_1) %>%
+  summarise(Freq = sum(Freq))
+
+bigrams_freq_with_unk <- bigrams_freq_with_unk %>%
+  group_by(last_word_1) %>%
+  mutate(logprobability = log(Freq / sum(Freq)))
+
+trigrams_freq_with_unk$last_word_2 =
+  substitute_low_freq_words(trigrams_freq_with_unk$last_word_2)
+trigrams_freq_with_unk$last_word_1 =
+  substitute_low_freq_words(trigrams_freq_with_unk$last_word_1)
+trigrams_freq_with_unk$last_word =
+  substitute_low_freq_words(trigrams_freq_with_unk$last_word)
+trigrams_freq_with_unk =
+  subset(trigrams_freq_with_unk, select = -trigrams)
+trigrams_freq_with_unk = trigrams_freq_with_unk %>%
+  group_by(last_word, last_word_1, last_word_2) %>%
+  summarise(Freq = sum(Freq))
+
+trigrams_freq_with_unk <- trigrams_freq_with_unk %>%
+  group_by(last_word_1, last_word_2) %>%
+  mutate(logprobability = log(Freq / sum(Freq)))
+
+# tests if the word is uknown (not in the high frequency words)
+# word: the word to test
+# returns boolean with the answer
+is_word_unkown = function(word) {
+  !word %in% unigrams_high_freq$unigrams
+}
+
+```
+
+For this first try of the project, a model is tried with the following elements
+- Words candidates from matching trigrams, bigrams and most common unigram
+- Probabilities with interpolation of trigrams, bigrams and unigrams.
+- The parameters for this interpolation will be found calculating the perplexity
+- To model the unknown tokens, in the training set the low frequency words (appearing 5 times or less) will be treated as unknown tokens.
+Here is the code which predicts the words
+
+```{r model, echo=TRUE}
+
+most_common_unigram = unigrams_freq[1, ]$unigrams
+
+# takes a text and using the last two words, tries to predict the next word
+# text: the text input
+# trigrams_coef: weight given to the trigrams prediction
+# bigrams_coef: weight given to the bigrams prediction
+# unigrams_coef: weight given to the unigrams prediction
+# returns a dataframe with the columns words and probability
+predict_next_word = function(text,
+                             trigrams_coef = 0.6,
+                             bigrams_coef = 0.3,
+                             unigrams_coef = 0.1) {
+  words = strsplit(text, " ")[[1]]
+  words_count = length(words)
+  
+  # break the text words
+  if (words_count == 0) {
+    return("")
+  }
+  if (words_count >= 1) {
+    last_word_1_input = words[words_count]
+    if (is_word_unkown(last_word_1_input))
+      last_word_1_input = unknown_word_token
+  }
+  if (words_count >= 2) {
+    last_word_2_input = words[words_count - 1]
+    if (is_word_unkown(last_word_2_input))
+      last_word_2_input = unknown_word_token
+  } else {
+    last_word_2_input = NA
+  }
+  
+  # check the trigrams and bigrams for the words
+  if (trigrams_coef != 0) {
+    trigrams_result = trigrams_freq_with_unk[trigrams_freq_with_unk$last_word_2 == last_word_2_input &
+                                               trigrams_freq_with_unk$last_word_1 == last_word_1_input &
+                                               trigrams_freq_with_unk$last_word != unknown_word_token
+                                             , ]
+  } else {
+    trigrams_result = data.frame(last_word = c(), logprobability = c())
+  }
+  
+  if (bigrams_coef != 0) {
+    bigrams_result = bigrams_freq_with_unk[bigrams_freq_with_unk$last_word_1 == last_word_1_input &
+                                             bigrams_freq_with_unk$last_word != unknown_word_token
+                                           , ]
+  } else {
+    bigrams_result = data.frame(last_word = c(), logprobability = c())
+  }
+  
+  # if no result return the most common unigram
+  if (NROW(trigrams_result) == 0 & NROW(bigrams_result) == 0)
+    return(data.frame(
+      words = c(most_common_unigram),
+      probability = 1
+    ))
+  
+  # get the probability of the candidates as unigrams
+  if (unigrams_coef != 0) {
+    candidate_words = c(trigrams_result$last_word, bigrams_result$last_word)
+    unigrams_result =  unigrams_high_freq[unigrams_high_freq$unigrams %in% candidate_words, ]
+  } else {
+    unigrams_result = data.frame(unigrams = c(), logprobability = c())
+  }
+  
+  log_trigrams_coef = ifelse(trigrams_coef == 0, 0, log(trigrams_coef))
+  log_bigrams_coef = ifelse(bigrams_coef == 0, 0, log(bigrams_coef))
+  log_unigrams_coef = ifelse(unigrams_coef == 0, 0, log(unigrams_coef))
+  
+  # join the scores for each word as tri, bi or unigram
+  probabilities_result = data.frame(
+    words = c(
+      trigrams_result$last_word,
+      bigrams_result$last_word,
+      as.character(unigrams_result$unigrams)
+    ),
+    score = c(
+      log_trigrams_coef + trigrams_result$logprobability,
+      log_bigrams_coef + bigrams_result$logprobability,
+      log_unigrams_coef + unigrams_result$logprobability
+    )
+  )
+  
+  probabilities_result = probabilities_result %>%
+    # add the scores of the same words as tri, bi or unigram
+    group_by(words) %>%
+    summarize(score = sum(exp(score))) %>%
+    # calculate the probability as standardizing the score
+    mutate(probability = score / sum(score)) %>%
+    arrange(desc(score))
+  
+  probabilities_result
+}
+
+
+predict_next_word_with_preprocess = function(text,
+                                             trigrams_coef = 0.6,
+                                             bigrams_coef = 0.3,
+                                             unigrams_coef = 0.1) {
+  text_corpus = SimpleCorpus(VectorSource(text))
+  preprocessed_text_corpus = preprocess_raw_corpus(text_corpus)
+  preprocessed_text = preprocessed_text_corpus[[1]]$content
+  predict_next_word(
+    preprocessed_text,
+    trigrams_coef = trigrams_coef,
+    bigrams_coef = bigrams_coef,
+    unigrams_coef = unigrams_coef
+  )
+}
+  
+```
+
+When called with the sentence "sth sth sth sth I want to" the following is obtained (first 10 rows)
+
+```{r}
+prediction = predict_next_word("sth sth sth sth i want to")
+prediction$score = round(prediction$score, 4)
+prediction$probability = round(prediction$probability, 4)
+head(prediction, 10)
+
+```
+
+## Parameters
+
+```{r perplexity_calculation}
+
+needed_variables <- c(
+  "predict_next_word",
+  "analyse_sentence_perplexity",
+  "default_probability",
+  "is_word_unkown",
+  "unigrams_high_freq",
+  "trigrams_freq_with_unk",
+  "bigrams_freq_with_unk",
+  "unknown_word_token",
+  "most_common_unigram",
+  "needed_variables",
+  "predict_next_word_with_preprocess",
+  "preprocess_raw_corpus",
+  "profanityTokens",
+  "preprocessed_validation_corpus",
+  "preprocessed_testing_corpus"
+)
+
+rm(list = setdiff(ls(), needed_variables))
+
+# if the wors is not found, to avoid 0 division
+default_probability = 0.000001
+
+# returns the log probability of a group of sentences using the model
+# sentences: array of sentences
+# trigrams_coef, bigrams_coef, unigrams_coef: variables for the model
+# returns a list with n (number of words) and logprobability (total logprobability)
+analyse_sentence_perplexity = function(sentences,
+                                       trigrams_coef,
+                                       bigrams_coef,
+                                       unigrams_coef) {
+  n = 0
+  logprobability = 0
+  
+  # applied for each sentence
+  lapply_add_sentence_perplexity =  function(sentence) {
+    words <- strsplit(sentence, "\\s")[[1]]
+    
+    lapply_analyse_word = function(words_index) {
+      # first word
+      if (words_index == 1) {
+        subsentence = ""
+      }
+      # next words
+      else {
+        subsentence = paste(words[1:(words_index - 1)], collapse = " ")
+      }
+      word_to_predict = words[[words_index]]
+      prediction_result = predict_next_word(subsentence,
+                                            trigrams_coef,
+                                            bigrams_coef,
+                                            unigrams_coef)
+      # if the prediction does not return anything
+      if (is.character(prediction_result)) {
+        logprobability = logprobability + log(default_probability)
+      }
+      else {
+        # find the correct probability
+        probability = filter(prediction_result,
+                             words == word_to_predict)[1, ]$probability
+        if (is.na(probability)) {
+          #if not found use the least probability
+          probability <<-
+            tail(prediction_result, n = 1)[1, ]$probability
+        } else {
+          logprobability <<- logprobability + log(probability)
+        }
+      }
+      n <<- n + 1
+    }
+    lapply(seq_along(words), lapply_analyse_word)
+  }
+  
+  lapply(sentences, lapply_add_sentence_perplexity)
+  
+  perplexity_analysis = list(logprobability = logprobability, n = n)
+  perplexity_analysis
+  
+}
+
+calculate_corpus_perplexity = function(corpus,
+                                       trigrams_coef,
+                                       bigrams_coef,
+                                       unigrams_coef) {
+  # cluster creation
+  num_cores <- detectCores() - 2
+  cluster <- makeCluster(num_cores, outfile = "./log.txt")
+
+  clusterExport(cluster, needed_variables)
+  corpus_chunks = split(corpus, 1:num_cores)
+  
+  lapply_analyse_chunk = function(corpus_chunk) {
+    library(tm)
+    library(dplyr)
+    library(stringi)
+    library(tidyr)
+    
+    chunk_perplexity_analysis = tm_map(
+      corpus_chunk,
+      analyse_sentence_perplexity,
+      trigrams_coef,
+      bigrams_coef,
+      unigrams_coef
+    )
+  }
+  perplexity_analysis <- parLapply(cluster,
+                                   corpus_chunks,
+                                   lapply_analyse_chunk)
+  final_result <- do.call(rbind, perplexity_analysis)
+  
+  stopCluster(cluster)
+  
+  total_n = 0
+  total_logprobability = 0
+  
+  # add the results of all nodes
+  lapply_get_total_perplexity = function(analysis) {
+    total_n <<- total_n + analysis$content$n
+    total_logprobability <<- total_logprobability +
+      analysis$content$logprobability
+  }
+  lapply(perplexity_analysis, lapply_get_total_perplexity)
+  
+  perplexity = exp(-total_logprobability / total_n)
+  
+}
+
+```
+
+To adjust the parameters of the uni, bi and trigram probabilities, the following set of parameters will be tried. The one with least perplexity will be chosen when applied on the validation set and the best set of parameters is the one ignoring bigrams and unigrams. To optimize calculations, 
+
+```{r parameters_testing}
+
+trigrams.parameter = c(1, 0.6, 0.6, 0.3)
+bigrams.parameter = c(0, 0.4, 0.3, 0.6)
+unigrams.parameter = c(0, 0, 0.1, 0.1)
+perplexity = lapply(1:length(trigrams.parameter), function(index) {
+  trigram_param = trigrams.parameter[index]
+  bigram_param = bigrams.parameter[index]
+  unigram_param = unigrams.parameter[index]
+  calculated_perplexity = calculate_corpus_perplexity(preprocessed_validation_corpus[1:50],
+                                                      trigram_param,
+                                                      bigram_param,
+                                                      unigram_param)
+  calculated_perplexity
+})
+
+coefficients_to_test = data.frame(
+  trigrams.parameter = trigrams.parameter,
+  bigrams.parameter = bigrams.parameter,
+  unigrams.parameter = unigrams.parameter,
+  perplexity = round(unlist(perplexity), 2)
+)
+coefficients_to_test
+```
+
+The model applied on the testing data gives the following perplexity value which is similar to the one obtained before.
+
+```{r}
+testing_perplexity = calculate_corpus_perplexity(preprocessed_testing_corpus, 1, 0, 0)
+testing_perplexity
+
+```
+
+# Conclusion
+
+The created model shows capacity to predict the following word, but it has some major problems to be corrected.
+
+- It cannot predict the use of numbers, punctuation or even uppercase.
+- The perplexity is biased since a arbitrary number has been used as probability if the word to predict were not in the list.
+- The modelling of unknown words could be done with Touring smoothing
+- The test has a correct perplexity because the source of the data is the same as for the testing and training
+- The perplexity has been made on a preprocessed data, because with punctuation, numbers and uppercase the perplexity would be much higher. 
+
+# Annex : code
+
+```{r, echo=TRUE, eval=FALSE, ref.label=c('libraries','read_raw_data','data_split','preprocessing','n_grams_creation','unigrams_plotting','bigrams_plotting','trigrams_plotting','vocabulary_coverage','modeling_preprocess','model','perplexity_calculation','parameters_testing')}
+
+```

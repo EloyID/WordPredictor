@@ -1,0 +1,10 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+Coursera-SwiftKey*
+rsconnect
+WordPredictorShinyApp/rsconnect
+WordPredictorShinyApp/en_US.blogs.txt
+WordPredictorShinyApp/en_US.news.txt
+WordPredictorShinyApp/en_US.twitter.txt
